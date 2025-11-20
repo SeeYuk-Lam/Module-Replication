@@ -1,0 +1,153 @@
+import torch
+from torch import nn
+import torch.nn.functional as F
+import math
+
+# 生成测试数据
+# batch,time,dimension
+# time指的是多少个词
+# 512就是embedding后要映射的词向量长度
+X = torch.randn(128, 64, 512)
+
+d_model = 512  # 词向量长度，每一个词都由一个长度为 512 的向量表示
+n_head = 8  # 8头
+
+
+# 多头注意力
+class multi_head_attention(nn.Module):
+    # 构造函数，两个参数
+    def __init__(self, d_model, n_head):
+        super().__init__()
+
+        self.n_head = n_head
+        self.d_model = d_model
+        # 这四个权重是层对象，里面装着权重矩阵，但它本身不是矩阵。
+        self.w_q = nn.Linear(d_model, d_model)
+        self.w_k = nn.Linear(d_model, d_model)
+        self.w_v = nn.Linear(d_model, d_model)
+        # 因为是多头注意力，最后需要用一个w_combine矩阵进行线性映射
+        self.w_combine = nn.Linear(d_model, d_model)
+        self.softmax = nn.Softmax(dim=-1)
+
+    # 输入的qkv并不是真的qkv，而是生成qkv的原材料，如果是自注意力，那么这三个值就是一样的
+    def forward(self, q, k, v, mask=None):
+        batch, time, dimension = q.shape
+        # 真正每个头的维度，要将总的除以8
+        n_d = self.d_model // self.n_head
+        # 这里才是真正的qkv
+        q, k, v = self.w_q(q), self.w_k(k), self.w_v(v)
+
+        # 维度划分
+        # 1. view: 把最后一维切开
+        # 原状: [batch, time, d_model] -> [128, 64, 512]
+        # 变形: [batch, time, n_head, head_dim] -> [128, 64, 8, 64]
+        # 2. permute: 交换维度
+        # 原状: [batch, time, n_head, head_dim] (0, 1, 2, 3)
+        # 目标: [batch, n_head, time, head_dim] (0, 2, 1, 3)
+        # time和head_dim才是在计算时会用到的
+        q = q.view(batch, time, self.n_head, n_d).permute(0, 2, 1, 3)
+        k = k.view(batch, time, self.n_head, n_d).permute(0, 2, 1, 3)
+        v = v.view(batch, time, self.n_head, n_d).permute(0, 2, 1, 3)
+
+        # q×k计算score,然后要将score经过softmax
+        # 对k的[time,n_d]进行转置成[n_d,time]
+        # #最后矩阵乘法后的score为[time,n_d]@[n_d,time]=[time,time]
+        score = q @ k.transpose(2, 3) / math.sqrt(n_d)
+        # 注意如果是encoder是进行self attention的，不需要进行mask
+        if mask is not None:
+            mask = torch.tril(torch.ones(time, time, dtype=bool))
+            # 把0转化为-无穷
+            score = score.masked_fill(mask == 0, float('-inf'))
+        score = self.softmax(score)
+        # [time,time]@[time,n_d] = [time,n_d]
+        score = score @ v
+
+        # 维度恢复,选择+把n_head和n_d乘起来恢复成dimension
+        score = score.permute(0, 2, 1, 3).contiguous().view(batch, time, dimension)
+
+        # 最后乘上w_combine[d_model,d_model]
+        out_put = self.w_combine(score)
+        return out_put
+
+
+# embedding
+
+class TokenEmdbedding(nn.Embedding):
+    def __init__(self, vocab_size, d_model):
+        super().__init__(vocab_size, d_model, padding_idx=1)
+
+
+# class PositionEmbedding(nn.Module):
+#     def __init__(self,d_model, maxlen=5000, device):
+#         super().__init__()
+#         self.encoding = torch.zeros(maxlen,d_model,device)
+#         self.encoding.requires_grad_(False)
+#
+#         pos = torch.arange(0, maxlen, device)
+#         pos = pos.float().unsqueeze(1)
+
+# LayerNorm 对通道c（也就是最后一个维度进行归一化）
+class LayerNorm(nn.Module):
+    def __init__(self, d_model, eps=1e-10):
+        super().__init__()
+        self.eps = eps  #超参数
+        self.gamma = nn.Parameter(torch.ones(d_model))
+        self.beta = nn.Parameter(torch.zeros(d_model))
+
+    def forward(self, x):
+        val = x.var(-1, unbias=False, keepdim=True)
+        mean = x.mean(-1, keepdim=True)
+        out = (x - mean) / (torch.sqrt(val + self.eps))
+        out = self.gamma * out + self.beta
+
+
+# FFN
+class PositionwiseFeedForward(nn.Module):
+    def __init__(self, d_model, hidden, dropout=0.1):
+        super().__init__()
+        fc1 = nn.Linear(d_model, hidden)
+        fc2 = nn.Linear(hidden, d_model)
+        dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.dropout(x)
+        x = self.fc2(x)
+        return x
+
+
+# Encoder Layer
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model, ffn_hidden, n_head, dropout):
+        super().__init__()
+        self.attention = multi_head_attention(d_model, n_head)
+        self.norm1 = LayerNorm(d_model)
+        self.drop1 = nn.Dropout(dropout)
+
+        self.ffn = PositionwiseFeedForward(d_model, ffn_hidden, dropout)
+        self.norm2 = LayerNorm(d_model)# layernorm是包含可学习参数的，得写两个
+        self.drop2 = nn.Dropout(dropout)
+
+    def forward(self, x):
+        res = x
+        x = self.attention(x, x, x, mask=None)
+        x = self.drop1(x)
+        x = self.norm1(x + res)  # add+norm层
+
+        res = x
+        x = self.ffn(x)
+        x = self.drop2(x)
+        x = self.norm2(x + res)
+        return x
+
+# DecoderLayer
+class DecoderLayer(nn.Module):
+    
+
+
+if __name__ == '__main__':
+    # 示例
+    attention = multi_head_attention(d_model, n_head)
+    out_put = attention(X, X, X)
+    print(out_put, out_put.shape)
