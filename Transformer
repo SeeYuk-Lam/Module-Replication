@@ -55,9 +55,10 @@ class multi_head_attention(nn.Module):
         score = q @ k.transpose(2, 3) / math.sqrt(n_d)
         # 注意如果是encoder是进行self attention的，不需要进行mask
         if mask is not None:
-            mask = torch.tril(torch.ones(time, time, dtype=bool))
+            # mask = torch.tril(torch.ones(time, time, dtype=bool))
             # 把0转化为-无穷
             score = score.masked_fill(mask == 0, float('-inf'))
+
         score = self.softmax(score)
         # [time,time]@[time,n_d] = [time,n_d]
         score = score @ v
@@ -70,21 +71,57 @@ class multi_head_attention(nn.Module):
         return out_put
 
 
-# embedding
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
 
-class TokenEmdbedding(nn.Embedding):
-    def __init__(self, vocab_size, d_model):
-        super().__init__(vocab_size, d_model, padding_idx=1)
+        # 初始化一个 [max_len, d_model] 的矩阵
+        pe = torch.zeros(max_len, d_model)
+
+        # 生成位置索引 [0, 1, ... max_len-1] -> [max_len, 1]
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+
+        # 计算分母 div_term: 10000^(2i/d_model)
+        # 在对数空间计算更数值稳定: exp( -2i * ln(10000) / d_model )
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+
+        # 偶数下标用 sin
+        pe[:, 0::2] = torch.sin(position * div_term)
+        # 奇数下标用 cos
+        pe[:, 1::2] = torch.cos(position * div_term)
+
+        # 增加一个维度以适配 batch: [1, max_len, d_model]
+        pe = pe.unsqueeze(0)
+
+        # 注册为 buffer (不是参数，不参与梯度更新，但会随模型保存状态)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        # x: [batch_size, seq_len, d_model]
+
+        # 取出对应长度的位置编码并相加
+        # 这里不需要 .to(device)，因为 register_buffer 会自动处理设备问题
+        x = x + self.pe[:, :x.size(1), :]
+        return self.dropout(x)
 
 
-# class PositionEmbedding(nn.Module):
-#     def __init__(self,d_model, maxlen=5000, device):
-#         super().__init__()
-#         self.encoding = torch.zeros(maxlen,d_model,device)
-#         self.encoding.requires_grad_(False)
-#
-#         pos = torch.arange(0, maxlen, device)
-#         pos = pos.float().unsqueeze(1)
+class TransformerEmbedding(nn.Module):
+    """
+    整合 Token Embedding 和 Positional Encoding
+    """
+
+    def __init__(self, vocab_size, d_model, max_len=5000, dropout=0.1):
+        super().__init__()
+        self.tok_emb = nn.Embedding(vocab_size, d_model, padding_idx=0)  # 假设0是padding
+        self.pos_emb = PositionalEncoding(d_model, dropout, max_len)
+
+    def forward(self, x):
+        # x: [batch_size, seq_len] (输入的单词索引)
+        tok_emb = self.tok_emb(x)  # -> [batch, seq_len, d_model]
+        out = self.pos_emb(tok_emb)
+        return out
+
 
 # LayerNorm 对通道c（也就是最后一个维度进行归一化）
 class LayerNorm(nn.Module):
@@ -99,14 +136,15 @@ class LayerNorm(nn.Module):
         mean = x.mean(-1, keepdim=True)
         out = (x - mean) / (torch.sqrt(val + self.eps))
         out = self.gamma * out + self.beta
+        return out
 
 
 # FFN
 class PositionwiseFeedForward(nn.Module):
     def __init__(self, d_model, hidden, dropout=0.1):
         super().__init__()
-        fc1 = nn.Linear(d_model, hidden)
-        fc2 = nn.Linear(hidden, d_model)
+        self.fc1 = nn.Linear(d_model, hidden)
+        self.fc2 = nn.Linear(hidden, d_model)
         dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -126,7 +164,7 @@ class EncoderLayer(nn.Module):
         self.drop1 = nn.Dropout(dropout)
 
         self.ffn = PositionwiseFeedForward(d_model, ffn_hidden, dropout)
-        self.norm2 = LayerNorm(d_model)# layernorm是包含可学习参数的，得写两个
+        self.norm2 = LayerNorm(d_model)  # layernorm是包含可学习参数的，得写两个
         self.drop2 = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -141,13 +179,63 @@ class EncoderLayer(nn.Module):
         x = self.norm2(x + res)
         return x
 
+
 # DecoderLayer
 class DecoderLayer(nn.Module):
-    
+    def __init__(self, d_model, ffn_hidden, n_head, dropout):
+        super().__init__()
+        self.attention1 = multi_head_attention(d_model, n_head)
+        self.norm1 = LayerNorm(d_model)
+        self.drop1 = nn.Dropout(dropout)
+
+        self.cross_attention = multi_head_attention(d_model, n_head)
+        self.norm2 = LayerNorm(d_model)
+        self.drop2 = nn.Dropout(dropout)
+
+        self.ffn = PositionwiseFeedForward(d_model, ffn_hidden, dropout)
+        self.norm3 = LayerNorm(d_model)
+        self.drop3 = nn.Dropout(dropout)
+
+    def forward(self, enx, dex, tgt_mask, memory_mask):
+        res = dex
+        # masked attention
+        dex = self.attention1(dex, dex, dex, mask=tgt_mask)
+        dex = self.drop1(dex)
+        dex = self.norm1(dex + res)
+
+        # cross attention
+        res = dex
+        dex = self.cross_attention(dex, enx, enx, mask=memory_mask)
+        dex = self.drop2(dex)
+        dex = self.norm2(dex + res)
+
+        # ffn
+        res = dex
+        dex = self.ffn(dex)
+        dex = self.drop3(dex)
+        dex = self.norm3(dex + res)
+
+        return dex
 
 
 if __name__ == '__main__':
-    # 示例
-    attention = multi_head_attention(d_model, n_head)
-    out_put = attention(X, X, X)
-    print(out_put, out_put.shape)
+    vocab_size = 1000
+    d_model = 512
+    max_len = 64
+
+    # 1. 实例化 Embedding 层
+    embedding_layer = TransformerEmbedding(vocab_size, d_model, max_len=100)
+
+    # 2. 模拟输入数据: [Batch=2, Seq_Len=10] (全是单词ID)
+    input_ids = torch.randint(0, vocab_size, (2, 10))
+
+    # 3. 前向传播
+    emb_out = embedding_layer(input_ids)
+
+    print("输入 ID 形状:", input_ids.shape)  # [2, 10]
+    print("Embedding 输出形状:", emb_out.shape)  # [2, 10, 512]
+
+    # 接下来的 Encoder
+    encoder_layer = EncoderLayer(d_model, ffn_hidden=2048, n_head=8, dropout=0.1)
+    enc_out = encoder_layer(emb_out)
+    print("Encoder 输出形状:", enc_out.shape)
